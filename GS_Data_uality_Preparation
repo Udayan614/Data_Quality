@@ -1,0 +1,204 @@
+
+
+### Impored Libraries 
+%pyspark
+import pandas as pd
+from pyspark.sql import Row
+from pyspark.sql.types import *
+from pyspark.sql.functions import lit
+
+### Assigning Values ####
+path = "s3://virginia.gdl.us.daap.processing.internal.zeotap.com/attribute_enrichment_layer/yr=2018/mon=01/dt=01/success/*"
+dp = "GDL"
+gender = "Female"
+OTR = 0.71
+
+#### Put the values as defined above ###########
+table=spark.read.format("com.databricks.spark.avro").load(path)
+
+#### Load a fiil from HDFS ##########
+Table_2=sc.textFile("hdfs:////user/hadoop/GS_Age_Map.csv").map(lambda x :x.split(",")).toDF(["DP", "Date", "Age_Group", "OTR"])
+
+Adding Headers:
+Table_2 = Table_2.rdd.zipWithIndex().filter(lambda (row,index): index > 0).keys()
+
+Show the final table with headers:
+Table_2 = Table_2.toDF()
+
+#### Insert new columns into data frame by using lit function ##########
+table = table.select(["Adid_Raw", "Demographic_Gender"])
+table = table.filter(table["Demographic_Gender"] == gender)
+table = table.withColumn("OTR", lit(OTR));
+table = table.withColumn("DP", lit(dp))
+table = table.withColumn("Gender", lit(gender))
+table = table.select(["Adid_Raw", "DP", "Gender", "OTR"])
+print(table.count())
+
+########## Appednd and write the files into  s3 bucket ###########
+
+table.write.format('com.databricks.spark.csv').mode('append').option("header", "true").save("s3://virginia.all.us.datascience.adhoc.internal.zeotap.com/GS_Raw/")
+
+############## Union all Df ####################################
+from functools import reduce  
+from pyspark.sql import DataFrame
+
+def unionAll(*dfs):
+    return reduce(DataFrame.unionAll, dfs)
+
+unionAll(Bucket_1, Bucket_2, Bucket_3, Bucket_4, Bucket_5, Bucket_6, Bucket_7, Bucket_8, Bucket_9,Bucket_10,Bucket_11)
+
+Final = unionAll(Bucket_1, Bucket_2, Bucket_3, Bucket_4, Bucket_5, Bucket_6, Bucket_7, Bucket_8, Bucket_9,Bucket_10,Bucket_11)
+
+################### Aggregate function and group by ##############
+from pyspark.sql.functions import count, avg
+df = df.groupby("Adid_Raw", "DP", "Gender").agg(avg("OTR").alias("OTR"))
+
+########## Group by gender ######################
+
+df.groupby("Gender").count().show()
+
+######### Calculating the proportion of male and female #############
+m_pr = float(289574643) / 549178108
+f_pr = float(259603465) / 549178108
+print(m_pr, f_pr)
+
+
+########## define a function for Gender ############
+def all_male(row):
+    new_row = row.asDict()
+    if row["Gender"] == "Female":
+        new_row["OTR"] = 1.0 - float(row["OTR"])
+        return(as_row(new_row))
+    else:
+        return(row)
+(Note: this function will return if Gender is female than 1.0 - OTR score for that Adid, which will ultimately convert all female OTR into Male )
+$$$$$$$$$ Create a dictionary to map to above def $$$$$$$$
+
+def as_row(obj):
+    if isinstance(obj, dict):
+        dictionary = {k: as_row(v) for k, v in obj.items()}
+        return Row(**dictionary)
+    elif isinstance(obj, list):
+        return [as_row(v) for v in obj]
+    else:
+        return obj
+########## convert the above RDD into DF ###########
+df = df.rdd.map(lambda x: all_male(x)).toDF()
+df.head(5)
+
+######### Make a list of all the OTR present for a Adid across data partner and Gender ##########
+df = df.groupby("Adid_Raw").agg(collect_list("OTR")).alias("OTR")
+df.show(5)
+
+########## Define a function ###################
+
+def calc_prob(row):
+    lst = row["collect_list(OTR)"]
+    res = {}
+    if len(lst) ==  1:
+        res["Adid_Raw"] = row["Adid_Raw"]
+        res["OTR"] = float(lst[0])
+        return(as_row(res))
+    else:
+        prod1 = m_pr
+        prod2 = f_pr
+        for i in lst:
+            prod1 *= float(i)
+            prod2 *= (1-float(i))
+        res["Adid_Raw"] = row["Adid_Raw"]
+        res["OTR"] = prod1 / (prod1 + prod2)
+        return(as_row(res))
+
+Note: For Adid 1 if present OTR is 0.72 and 0.63 (as we converted everything into Male by transforming (1-OTR) above. Our calculation of probability would be:
+(0.72*0.63*0.52)/(0.72*0.63*0.52)+(0.28*0.27*0.42)
+Assuming: 1) 0.52 is the proportion of Male present in the DataSet, which we derived on above ‘m_pr’ calculation and 0.42 represents female proportion present in the dataset which we derived from ‘f-pr’ calculation
+          2) (1.0-0.72)0.28 and (1.0-0.63)0.27
+
+Passed above define function and save as df1 using map function :
+
+df1 = df.rdd.map(lambda x: calc_prob(x)).toDF()
+df.show(5)
+
+########## define function for calculating female probability #########
+def fem_prob(row):
+    res = {}
+    res["Adid_Raw"] = row["Adid_Raw"]
+    res["Male_prob"] = float(row["OTR"])
+    res["Female_prob"] = (1.0 - float(row["OTR"]))
+    return(as_row(res))
+
+Passed above define function and save as df2 using map function :
+
+df2 = df1.rdd.map(lambda x: fem_prob(x)).toDF()
+df2.show()
+
+################### Group by #################################
+select CEILING(Male_prob*100) , count(Adid_Raw) as count  from   df_retest group by  CEILING(Male_prob*100) order by  CEILING(Male_prob*100) desc 
+
+################### Age Grouping #############################
+def age_group(row):
+    new_row = row.asDict()
+    age = float(new_row["Demographic_MaxAge"])
+    if ((age < 25) & (age >= 18)):
+        new_row["Age_Group"] = "18-24"
+    elif age < 35:
+        new_row["Age_Group"] = "25-34"
+    elif age < 45:
+        new_row["Age_Group"] = "35-44"
+    elif age < 55:
+        new_row["Age_Group"] = "45-54"
+    elif age < 65:
+        new_row["Age_Group"] = "55-64"
+    elif age >= 65:
+        new_row["Age_Group"] = "65+"
+    else:
+        new_row["Age_Group"] = "Invalid"
+    return(as_row(new_row))
+
+def as_row(obj):
+    if isinstance(obj, dict):
+        dictionary = {k: as_row(v) for k, v in obj.items()}
+        return Row(**dictionary)
+    elif isinstance(obj, list):
+        return [as_row(v) for v in obj]
+    else:
+        return obj
+
+#### Function to convert a column of integer to percentage ###
+def conv_prob(row):
+    new_row = row.asDict()
+    new_row["OTR"] = float(new_row["OTR"]) / 100.0
+    return(as_row(new_row))
+
+def as_row(obj):
+    if isinstance(obj, dict):
+        dictionary = {k: as_row(v) for k, v in obj.items()}
+        return Row(**dictionary)
+    elif isinstance(obj, list):
+        return [as_row(v) for v in obj]
+    else:
+        return obj
+
+##### Join on Multiple Columns ######
+
+Final_Table=spark.sql("SELECT Table_1.Adid_Raw,Table_1.Age_Group,Table_1.DP,Table_1.Date,Table_2.OTR FROM Table_1 JOIN Table_2 ON Table_1.Age_group = Table_2.Age_Group AND Table_1.Date = Table_2.Date AND Table_1.DP=Table_2.DP")
+
+#### Filter out the Null values ####
+Final_Agg_df.where(col("collect_list(OTR)").isNull()).show()
+
+Final_Agg_df.where(size(col("collect_list(OTR)")) <= 0).count()
+
+
+
+_______________________________________________________________
+
+Python: 
+
+Change only one value in a table:
+cv.set_value(2,"salary", 30)#index 2 will be changed as 30 under salary
+
+If you want to change all the values, where 'Ip' is equal to 127.0.0.2, run:
+
+
+df.loc[df["Ip"]=="127.0.0.2", "Sites"] = 30
+
